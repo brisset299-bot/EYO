@@ -131,9 +131,9 @@ def mm1_table(
 
     return pd.DataFrame({
         "Día": DIAS,
-        "Sénior (h)": S,
-        "Júnior (h)": J,
-        "Horas médico": S + J,
+        "Sénior (médicos)": S,
+        "Júnior (médicos)": J,
+        "Total médicos": S + J,
         "Pacientes": demanda,
         "Tasa servicio": capacidad / (S + J),
         "Capacidad": capacidad,
@@ -393,7 +393,7 @@ def optimizar_escenario1(
         "Categoría": [r[0] for r in rutas],
         "Origen": [DIAS[r[1]] for r in rutas],
         "Destino": [DIAS[r[2]] for r in rutas],
-        "Horas trasladadas": x[:8],
+        "Médicos trasladados": x[:8],
     })
 
     return {
@@ -723,25 +723,40 @@ def ejecutar_simulacion_mm1(
 
 def generar_llegadas_arena(pacientes_dia, horas_dia, modo, rng):
     """
-    Primera lógica planteada para Arena:
-    se conserva exactamente la demanda diaria.
+    Genera exactamente la demanda diaria, pero con llegadas aleatorias.
+
+    Estable:
+        Proceso homogéneo: dado que conocemos exactamente N pacientes,
+        sus tiempos de llegada se generan como N puntos aleatorios
+        ordenados dentro de la jornada. Esto equivale a un proceso
+        Poisson condicionado a N llegadas.
+
+    Variable:
+        Se generan interarribos exponenciales y se normalizan para que
+        exactamente N pacientes lleguen durante la jornada, permitiendo
+        mayor agrupación aleatoria de llegadas.
     """
     n = int(pacientes_dia)
     if n <= 0:
         return np.array([], dtype=float)
 
-    horizonte_min = horas_dia * 60.0
+    horizonte_min = float(horas_dia) * 60.0
 
     if modo == "Estable":
-        return np.linspace(0.0, horizonte_min, n, endpoint=False)
+        llegadas = np.sort(
+            rng.uniform(0.0, horizonte_min, size=n)
+        )
+        return llegadas
 
     inter = rng.exponential(scale=1.0, size=n)
     tiempos = np.cumsum(inter)
 
     if tiempos[-1] <= 0:
-        return np.linspace(0.0, horizonte_min, n, endpoint=False)
+        return np.sort(
+            rng.uniform(0.0, horizonte_min, size=n)
+        )
 
-    return tiempos / tiempos[-1] * (horizonte_min - 0.01)
+    return tiempos / tiempos[-1] * horizonte_min
 
 
 def simular_semana_arena(
@@ -757,30 +772,44 @@ def simular_semana_arena(
     semilla,
 ):
     """
-    Simulación agregada con lógica equivalente a Arena:
+    Simulación tipo Arena para el Escenario 2.
 
-        Llegadas -> cola FCFS -> pool médico -> atención -> salida.
+    Lógica:
+        Llegadas -> Cola FCFS -> capacidad médica agregada -> Atención -> Salida
 
-    IMPORTANTE:
-    - Sénior y Júnior representan PERSONAL, no horas.
-    - El promedio de referencia es 2.41 pac/h-médico.
-    - Las tasas Sénior/Júnior se calibran para que el mix actual
-      del domingo (60/204) tenga media 2.41.
-    - La variabilidad representa médicos más rápidos y más lentos.
-    - El número de médicos se convierte a puestos simultáneos
-      equivalentes mediante personal total / horas de operación.
-      Esto reproduce la capacidad de la tabla: médicos x tasa.
+    Corrección metodológica importante:
+    - Sénior/Júnior = número de médicos, NO horas.
+    - La capacidad diaria se mantiene consistente con la tabla:
+          capacidad_día = médicos_totales * tasa_mix
+    - Esa capacidad diaria se convierte a capacidad por hora:
+          capacidad_hora = capacidad_día / horas_dia
+    - Los pacientes llegan aleatoriamente, no cada cierto número fijo
+      de minutos.
+    - El tiempo de atención es aleatorio y heterogéneo, manteniendo
+      como media la capacidad del sistema.
+    - Cada día se simula de manera independiente, como en la lógica
+      planteada originalmente para el Escenario 2.
+    - La demanda diaria se conserva exactamente.
     """
     resultados = []
+
     pacientes = np.asarray(pacientes, dtype=float)
     personal_senior = np.asarray(personal_senior, dtype=float)
     personal_junior = np.asarray(personal_junior, dtype=float)
 
     cv = max(float(variabilidad_pct), 0.0) / 100.0
-    sigma_ln = math.sqrt(math.log(1.0 + cv**2)) if cv > 0 else 0.0
+
+    # Parámetro de dispersión lognormal.
+    sigma_ln = (
+        math.sqrt(math.log(1.0 + cv ** 2))
+        if cv > 0
+        else 0.0
+    )
 
     for rep in range(int(replicas)):
-        rng = np.random.default_rng(int(semilla) + rep)
+        rng = np.random.default_rng(
+            int(semilla) + rep
+        )
 
         for d, dia in enumerate(DIAS):
             n = int(pacientes[d])
@@ -791,66 +820,163 @@ def simular_semana_arena(
             if total_personal <= 0 or n <= 0:
                 continue
 
-            # Puestos simultáneos equivalentes. Con 264 personas y 24 h:
-            # 264/24 = 11 puestos equivalentes; capacidad esperada =
-            # 11 * 24 * 2.41 = 636.24 pacientes/día.
-            puestos_equiv = total_personal / float(horas_dia)
+            proporcion_senior = ns / total_personal
 
-            # Generamos velocidades individuales alrededor de la media
-            # del mix del día. Se usa lognormal para asegurar tasas > 0.
-            prob_senior = ns / total_personal
-            tasa_mix = prob_senior * tasa_senior + (1.0 - prob_senior) * tasa_junior
+            # Tasa media del mix de personal.
+            tasa_mix = (
+                proporcion_senior * tasa_senior
+                + (1.0 - proporcion_senior) * tasa_junior
+            )
 
-            if sigma_ln > 0:
-                # Ajuste para conservar la media aritmética en tasa_mix.
-                mu_ln = math.log(max(tasa_mix, 1e-9)) - 0.5 * sigma_ln**2
-                tasas_paciente = rng.lognormal(
-                    mean=mu_ln,
-                    sigma=sigma_ln,
-                    size=n,
-                )
-            else:
-                tasas_paciente = np.full(n, tasa_mix)
+            # Capacidad diaria coherente con la tabla del caso.
+            capacidad_dia = total_personal * tasa_mix
 
-            # Capacidad horaria agregada del pool.
-            capacidad_hora = puestos_equiv * tasa_mix
+            # Capacidad equivalente por hora.
+            capacidad_hora = capacidad_dia / float(horas_dia)
+
             if capacidad_hora <= 0:
                 continue
 
-            servicio_medio_min = 60.0 / capacidad_hora
-
+            # Llegadas aleatorias manteniendo exactamente N pacientes.
             llegadas = generar_llegadas_arena(
-                n, horas_dia, modo_llegadas, rng
+                n,
+                horas_dia,
+                modo_llegadas,
+                rng,
             )
 
-            # Cola FCFS agregada. La heterogeneidad se incorpora en
-            # el tiempo de servicio de cada paciente.
+            # ====================================================
+            # TIEMPOS DE SERVICIO
+            # ====================================================
+            #
+            # El servicio medio del sistema es:
+            #
+            #   60 / capacidad_hora   minutos/paciente
+            #
+            # La variabilidad representa médicos más rápidos
+            # y más lentos sin cambiar la capacidad media.
+            #
+            # Se usa una variable de velocidad alrededor de 1.
+            # Se normaliza de modo que E[1/factor] = 1, preservando
+            # el tiempo medio de servicio.
+            # ====================================================
+
+            if sigma_ln > 0:
+                raw = rng.lognormal(
+                    mean=-0.5 * sigma_ln ** 2,
+                    sigma=sigma_ln,
+                    size=n,
+                )
+
+                normalizador = np.mean(1.0 / raw)
+                factores_velocidad = raw * normalizador
+            else:
+                factores_velocidad = np.ones(n)
+
+            # Componente exponencial del tiempo de atención.
+            trabajos = rng.exponential(
+                scale=1.0,
+                size=n,
+            )
+
+            servicio_base_h = 1.0 / capacidad_hora
+
+            tiempos_servicio_min = (
+                trabajos
+                * servicio_base_h
+                * 60.0
+                / factores_velocidad
+            )
+
+            # ====================================================
+            # COLA FCFS
+            # ====================================================
+
             disponible = 0.0
+
             esperas = []
-            tiempos_sistema = []
+            sistemas = []
+            salidas = []
+
+            # Para calcular correctamente la cantidad de pacientes
+            # que estaban esperando cuando llega cada paciente.
+            salidas_anteriores = []
+
+            puntero_salida = 0
             cola_max = 0
 
-            for t_llegada, tasa_individual in zip(llegadas, tasas_paciente):
-                # La tasa individual está expresada por médico-hora;
-                # se escala por los puestos equivalentes del pool.
-                servicio_min = 60.0 / max(tasa_individual * puestos_equiv, 1e-9)
-                inicio = max(t_llegada, disponible)
-                espera = inicio - t_llegada
-                salida = inicio + servicio_min
+            for idx, (llegada, servicio) in enumerate(
+                zip(llegadas, tiempos_servicio_min)
+            ):
+                # Liberamos conceptualmente todos los pacientes
+                # terminados antes de esta llegada.
+                while (
+                    puntero_salida < len(salidas_anteriores)
+                    and salidas_anteriores[puntero_salida]
+                    <= llegada
+                ):
+                    puntero_salida += 1
 
-                if espera > 0:
-                    cola_actual = max(
-                        1,
-                        int(np.ceil(espera / max(servicio_medio_min, 1e-12))),
-                    )
-                    cola_max = max(cola_max, cola_actual)
+                pacientes_en_sistema = (
+                    idx - puntero_salida
+                )
+
+                # En un único servidor equivalente, uno puede estar
+                # siendo atendido; el resto forma la cola.
+                cola_actual = max(
+                    0,
+                    pacientes_en_sistema - 1,
+                )
+
+                cola_max = max(
+                    cola_max,
+                    cola_actual,
+                )
+
+                inicio = max(
+                    llegada,
+                    disponible,
+                )
+
+                espera = inicio - llegada
+                salida = inicio + servicio
 
                 esperas.append(espera)
-                tiempos_sistema.append(salida - t_llegada)
+                sistemas.append(
+                    salida - llegada
+                )
+                salidas.append(salida)
+                salidas_anteriores.append(salida)
+
                 disponible = salida
 
-            capacidad_dia = total_personal * tasa_mix
-            utilizacion = n / capacidad_dia if capacidad_dia > 0 else np.nan
+            esperas = np.asarray(
+                esperas,
+                dtype=float,
+            )
+
+            sistemas = np.asarray(
+                sistemas,
+                dtype=float,
+            )
+
+            salidas = np.asarray(
+                salidas,
+                dtype=float,
+            )
+
+            horizonte_min = float(horas_dia) * 60.0
+
+            # Pacientes que todavía no terminaron al cerrar la jornada.
+            pendientes = int(
+                np.sum(salidas > horizonte_min)
+            )
+
+            utilizacion = (
+                n / capacidad_dia
+                if capacidad_dia > 0
+                else np.nan
+            )
 
             resultados.append({
                 "Réplica": rep + 1,
@@ -859,26 +985,31 @@ def simular_semana_arena(
                 "Sénior": ns,
                 "Júnior": nj,
                 "Total médicos": total_personal,
-                "Puestos equivalentes": puestos_equiv,
                 "Tasa mix": tasa_mix,
                 "Capacidad": capacidad_dia,
                 "Utilización": utilizacion,
                 "Espera promedio (min)": np.mean(esperas),
-                "Espera P90 (min)": np.percentile(esperas, 90),
-                "Tiempo sistema promedio (min)": np.mean(tiempos_sistema),
+                "Espera P90 (min)": np.percentile(
+                    esperas,
+                    90,
+                ),
+                "Tiempo sistema promedio (min)": np.mean(
+                    sistemas
+                ),
                 "Máxima cola": int(cola_max),
+                "Pacientes pendientes": pendientes,
             })
 
     detalle = pd.DataFrame(resultados)
 
     resumen = (
-        detalle.groupby("Día", sort=False)
+        detalle
+        .groupby("Día", sort=False)
         .agg({
             "Pacientes": "mean",
             "Sénior": "mean",
             "Júnior": "mean",
             "Total médicos": "mean",
-            "Puestos equivalentes": "mean",
             "Tasa mix": "mean",
             "Capacidad": "mean",
             "Utilización": "mean",
@@ -886,28 +1017,58 @@ def simular_semana_arena(
             "Espera P90 (min)": "mean",
             "Tiempo sistema promedio (min)": "mean",
             "Máxima cola": "mean",
+            "Pacientes pendientes": "mean",
         })
         .reset_index()
     )
 
-    globales = (
-        detalle.groupby("Réplica", sort=False)
-        .agg({
-            "Espera promedio (min)": "mean",
-            "Espera P90 (min)": "mean",
-            "Máxima cola": "max",
-        })
-        .reset_index()
-        .rename(columns={
-            "Espera promedio (min)": "Espera promedio semanal (min)",
-            "Espera P90 (min)": "P90 promedio diario (min)",
-            "Máxima cola": "Cola máxima semanal",
-        })
-    )
+    # ============================================================
+    # RESULTADOS GLOBALES
+    # ============================================================
+    #
+    # La espera semanal se pondera por pacientes, no como promedio
+    # simple de los siete promedios diarios.
+    # ============================================================
 
-    globales["Pacientes pendientes"] = 0
+    globales = []
 
-    return {"resumen": resumen, "detalle": detalle, "global": globales}
+    for rep, grupo in detalle.groupby(
+        "Réplica",
+        sort=False,
+    ):
+        total_pacientes = grupo["Pacientes"].sum()
+
+        espera_ponderada = (
+            np.sum(
+                grupo["Espera promedio (min)"]
+                * grupo["Pacientes"]
+            )
+            / total_pacientes
+            if total_pacientes > 0
+            else np.nan
+        )
+
+        globales.append({
+            "Réplica": rep,
+            "Espera promedio semanal (min)": espera_ponderada,
+            "P90 promedio diario (min)": grupo[
+                "Espera P90 (min)"
+            ].mean(),
+            "Cola máxima semanal": grupo[
+                "Máxima cola"
+            ].max(),
+            "Pacientes pendientes": grupo[
+                "Pacientes pendientes"
+            ].sum(),
+        })
+
+    globales = pd.DataFrame(globales)
+
+    return {
+        "resumen": resumen,
+        "detalle": detalle,
+        "global": globales,
+    }
 
 
 # ============================================================
@@ -1243,7 +1404,6 @@ with st.sidebar:
     )
 
     st.divider()
-
     st.header("Parámetros de simulación")
 
     if escenario.startswith("Escenario 1"):
@@ -1254,57 +1414,15 @@ with st.sidebar:
             value=24.0,
             step=1.0,
         )
-
         st.subheader("Límites de traslado")
-
-        max_s_fri = st.number_input(
-            "Sénior: máximo desde viernes",
-            0.0,
-            float(S_BASE[5]),
-            float(S_BASE[5]),
-            1.0,
-        )
-
-        max_s_sab = st.number_input(
-            "Sénior: máximo desde sábado",
-            0.0,
-            float(S_BASE[6]),
-            float(S_BASE[6]),
-            1.0,
-        )
-
-        max_j_fri = st.number_input(
-            "Júnior: máximo desde viernes",
-            0.0,
-            float(J_BASE[5]),
-            float(J_BASE[5]),
-            1.0,
-        )
-
-        max_j_sab = st.number_input(
-            "Júnior: máximo desde sábado",
-            0.0,
-            float(J_BASE[6]),
-            float(J_BASE[6]),
-            1.0,
-        )
-
+        max_s_fri = st.number_input("Sénior: máximo desde viernes", 0.0, float(S_BASE[5]), float(S_BASE[5]), 1.0)
+        max_s_sab = st.number_input("Sénior: máximo desde sábado", 0.0, float(S_BASE[6]), float(S_BASE[6]), 1.0)
+        max_j_fri = st.number_input("Júnior: máximo desde viernes", 0.0, float(J_BASE[5]), float(J_BASE[5]), 1.0)
+        max_j_sab = st.number_input("Júnior: máximo desde sábado", 0.0, float(J_BASE[6]), float(J_BASE[6]), 1.0)
         st.subheader("Réplicas")
-
-        replicas = st.slider(
-            "Número de réplicas",
-            10, 300, 100, 10
-        )
-
-        warmup = st.number_input(
-            "Calentamiento (h)",
-            0.0, 72.0, 0.0, 1.0
-        )
-
-        semilla = st.number_input(
-            "Semilla",
-            1, 999999, 42, 1
-        )
+        replicas = st.slider("Número de réplicas", 10, 300, 100, 10)
+        warmup = st.number_input("Calentamiento (h)", 0.0, 72.0, 0.0, 1.0)
+        semilla = st.number_input("Semilla", 1, 999999, 42, 1)
 
     elif escenario.startswith("Escenario 2"):
         tasa_2 = st.number_input(
@@ -1313,65 +1431,44 @@ with st.sidebar:
             max_value=10.0,
             value=2.41,
             step=0.01,
-            help="Promedio de atención por médico-hora. Se utiliza como referencia para calibrar las velocidades del personal.",
         )
-
         horas_dia_2 = st.number_input(
             "Horas de operación por día",
             min_value=1.0,
             max_value=24.0,
             value=24.0,
             step=1.0,
-            help="Se utiliza para obtener la demanda por hora y el número equivalente de puestos médicos simultáneos.",
         )
-
         st.subheader("Domingo")
-
         senior_dom = st.slider(
             "Médicos Sénior domingo",
             min_value=0,
             max_value=264,
             value=60,
             step=1,
-            help="Cantidad de médicos Sénior. El total del domingo se mantiene en 264 médicos; los Júnior se calculan automáticamente.",
         )
-
         variabilidad_2 = st.slider(
             "Variabilidad de velocidad entre médicos (%)",
             min_value=0.0,
             max_value=40.0,
             value=15.0,
             step=1.0,
-            help="Representa que algunos médicos son más rápidos y otros más lentos. 0% significa misma velocidad para todos.",
         )
-
         diferencia_mix_2 = st.slider(
             "Diferencia de velocidad Sénior vs Júnior (%)",
             min_value=0.0,
             max_value=40.0,
             value=10.0,
             step=1.0,
-            help="Supuesto experimental para que el cambio de mix tenga efecto. Se calibra para que el mix actual tenga una media de 2.41 pac/h-médico.",
         )
-
         modo_llegadas_2 = st.radio(
             "Flujo de llegada",
             ["Estable", "Variable"],
             index=0,
-            help="Estable: llegadas distribuidas uniformemente. Variable: interarribos aleatorios con demanda diaria conservada.",
         )
-
         st.subheader("Réplicas")
-
-        replicas_2 = st.slider(
-            "Número de réplicas",
-            10, 500, 100, 10
-        )
-
-        semilla_2 = st.number_input(
-            "Semilla",
-            1, 999999, 42, 1
-        )
+        replicas_2 = st.slider("Número de réplicas", 10, 500, 100, 10)
+        semilla_2 = st.number_input("Semilla", 1, 999999, 42, 1)
 
     else:
         tasa_3 = st.number_input(
@@ -1381,7 +1478,6 @@ with st.sidebar:
             value=2.40,
             step=0.05,
         )
-
         horas_dia_3 = st.number_input(
             "Horas de operación por día",
             min_value=1.0,
@@ -1389,7 +1485,6 @@ with st.sidebar:
             value=23.0,
             step=1.0,
         )
-
         mix_3 = st.slider(
             "Mix Sénior objetivo (%)",
             0.0,
@@ -1397,14 +1492,9 @@ with st.sidebar:
             35.0,
             1.0,
         ) / 100
-
         st.subheader("Horas objetivo Escenario 3")
-
         h3 = []
-        for d, default in zip(
-            DIAS,
-            ESC3_HORAS_DEFAULT
-        ):
+        for d, default in zip(DIAS, ESC3_HORAS_DEFAULT):
             h3.append(
                 st.number_input(
                     f"{d} (h)",
@@ -1414,26 +1504,11 @@ with st.sidebar:
                     step=0.01,
                 )
             )
-
         h3 = np.array(h3)
-
         st.subheader("Réplicas")
-
-        replicas_3 = st.slider(
-            "Número de réplicas",
-            10, 300, 100, 10
-        )
-
-        warmup_3 = st.number_input(
-            "Calentamiento (h)",
-            0.0, 72.0, 0.0, 1.0
-        )
-
-        semilla_3 = st.number_input(
-            "Semilla",
-            1, 999999, 42, 1
-        )
-
+        replicas_3 = st.slider("Número de réplicas", 10, 300, 100, 10)
+        warmup_3 = st.number_input("Calentamiento (h)", 0.0, 72.0, 0.0, 1.0)
+        semilla_3 = st.number_input("Semilla", 1, 999999, 42, 1)
 
 # ============================================================
 # ENCABEZADO DINÁMICO
@@ -1441,13 +1516,452 @@ with st.sidebar:
 
 if escenario.startswith("Escenario 1"):
     st.subheader("🔵 Escenario 1 — Rebalanceo semanal")
-
     st.write(
-        "Se redistribuyen horas médicas existentes desde viernes y "
-        "sábado hacia domingo y lunes. Martes, miércoles y jueves "
-        "permanecen sin cambios. El objetivo es maximizar la menor "
-        "cobertura de demanda diaria."
+        "Se redistribuyen médicos disponibles desde viernes y sábado "
+        "hacia domingo y lunes. Martes, miércoles y jueves permanecen "
+        "sin cambios. El objetivo es maximizar la menor cobertura de "
+        "demanda diaria sin aumentar el personal semanal."
     )
+elif escenario.startswith("Escenario 2"):
+    st.subheader("🟢 Escenario 2 — Reestructuración del mix del domingo")
+    st.write(
+        "Se mantiene el total de 264 médicos del domingo, pero se modifica "
+        "la proporción Sénior/Júnior. El efecto se evalúa mediante una "
+        "simulación independiente."
+    )
+else:
+    st.subheader("🟣 Escenario 3 — Reestructuración semanal")
+    st.write(
+        "Se evalúa una distribución semanal de horas médicas propuesta, "
+        "con un mix Sénior/Júnior objetivo configurable."
+    )
+
+# ============================================================
+# KPI COMUNES
+# ============================================================
+
+if escenario.startswith("Escenario 1"):
+    demanda_kpi = TOTAL_DEMANDA
+    personal_kpi = TOTAL_HORAS
+    tasa_kpi = "S/J diferenciada"
+    operacion_kpi = f"{horas_dia:.0f} h/día"
+elif escenario.startswith("Escenario 2"):
+    demanda_kpi = TOTAL_DEMANDA
+    personal_kpi = TOTAL_HORAS
+    tasa_kpi = f"{tasa_2:.2f}"
+    operacion_kpi = f"{horas_dia_2:.0f} h/día"
+else:
+    demanda_kpi = TOTAL_DEMANDA
+    personal_kpi = h3.sum()
+    tasa_kpi = f"{tasa_3:.2f}"
+    operacion_kpi = f"{horas_dia_3:.0f} h/día"
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Demanda semanal", f"{demanda_kpi:,.0f} pacientes")
+k2.metric("Personal / horas objetivo", f"{personal_kpi:,.0f}")
+k3.metric("Tasa base", tasa_kpi)
+k4.metric("Operación", operacion_kpi)
+
+# ============================================================
+# ESCENARIO 1
+# ============================================================
+
+if escenario.startswith("Escenario 1"):
+
+    st.header("1. Situación actual")
+
+    actual = mm1_table(
+        S_BASE,
+        J_BASE,
+        DEMANDA,
+        horas_dia=horas_dia,
+        tasa_s=RATE_SENIOR,
+        tasa_j=RATE_JUNIOR,
+    )
+
+    st.dataframe(
+        actual.style.format({
+            "Sénior (médicos)": "{:.0f}",
+            "Júnior (médicos)": "{:.0f}",
+            "Total médicos": "{:.0f}",
+            "Pacientes": "{:.0f}",
+            "Tasa servicio": "{:.4f}",
+            "Capacidad": "{:.2f}",
+            "Lambda (pac/h)": "{:.4f}",
+            "Mu (pac/h)": "{:.4f}",
+            "Utilización": "{:.2%}",
+            "Wq (min)": "{:.2f}",
+            "W (min)": "{:.2f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.header("2. Optimización")
+
+    if st.button(
+        "⚙️ Calcular propuesta del Escenario 1",
+        type="primary",
+        use_container_width=True,
+    ):
+        resultado = optimizar_escenario1(
+            max_s_fri,
+            max_s_sab,
+            max_j_fri,
+            max_j_sab,
+        )
+
+        if resultado is None:
+            st.error(
+                "No existe una solución factible con los límites "
+                "de traslado seleccionados."
+            )
+        else:
+            st.session_state["esc1_resultado"] = resultado
+
+    resultado = st.session_state.get(
+        "esc1_resultado"
+    )
+
+    if resultado is not None:
+        S_new = resultado["S"]
+        J_new = resultado["J"]
+
+        propuesta = mm1_table(
+            S_new,
+            J_new,
+            DEMANDA,
+            horas_dia=horas_dia,
+            tasa_s=RATE_SENIOR,
+            tasa_j=RATE_JUNIOR,
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Cobertura mínima z",
+            f"{resultado['z']:.6f}",
+        )
+
+        c2.metric(
+            "Máxima utilización equivalente",
+            f"{1 / resultado['z']:.2%}",
+        )
+
+        c3.metric(
+            "Médicos trasladados",
+            f"{resultado['total_trasladado']:.2f}",
+        )
+
+        st.subheader("Traslados realizados")
+
+        movimientos = resultado["movimientos"]
+
+        mostrar = movimientos[
+            movimientos["Médicos trasladados"] > 1e-8
+        ].copy()
+
+        if len(mostrar):
+            st.dataframe(
+                mostrar.style.format({
+                    "Médicos trasladados": "{:.2f}"
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info(
+                "Con los límites seleccionados, no se requieren traslados."
+            )
+
+        st.subheader("Actual vs Escenario 1")
+
+        tabla_c = pd.DataFrame({
+            "Día": DIAS,
+            "Sénior actual": S_BASE,
+            "Sénior Esc. 1": S_new,
+            "Júnior actual": J_BASE,
+            "Júnior Esc. 1": J_new,
+            "Capacidad actual": actual["Capacidad"],
+            "Capacidad Esc. 1": propuesta["Capacidad"],
+            "Utilización actual": actual["Utilización"],
+            "Utilización Esc. 1": propuesta["Utilización"],
+            "Wq actual": actual["Wq (min)"],
+            "Wq Esc. 1": propuesta["Wq (min)"],
+        })
+
+        st.dataframe(
+            tabla_c.style.format({
+                "Sénior actual": "{:.2f}",
+                "Sénior Esc. 1": "{:.2f}",
+                "Júnior actual": "{:.2f}",
+                "Júnior Esc. 1": "{:.2f}",
+                "Capacidad actual": "{:.2f}",
+                "Capacidad Esc. 1": "{:.2f}",
+                "Utilización actual": "{:.2%}",
+                "Utilización Esc. 1": "{:.2%}",
+                "Wq actual": "{:.2f}",
+                "Wq Esc. 1": "{:.2f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Gráfico de horas
+        fig, ax = plt.subplots(figsize=(11, 5))
+        x = np.arange(7)
+        width = 0.18
+
+        ax.bar(
+            x - 1.5 * width,
+            S_BASE,
+            width,
+            label="Sénior actual",
+        )
+        ax.bar(
+            x - 0.5 * width,
+            S_new,
+            width,
+            label="Sénior Escenario 1",
+        )
+        ax.bar(
+            x + 0.5 * width,
+            J_BASE,
+            width,
+            label="Júnior actual",
+        )
+        ax.bar(
+            x + 1.5 * width,
+            J_new,
+            width,
+            label="Júnior Escenario 1",
+        )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(DIAS)
+        ax.set_ylabel("Médicos")
+        ax.set_title(
+            "Personal médico antes y después — Escenario 1"
+        )
+        ax.legend()
+        ax.grid(axis="y", alpha=0.25)
+
+        st.pyplot(fig, use_container_width=True)
+
+        # Utilización
+        fig, ax = plt.subplots(figsize=(11, 4.5))
+
+        ax.plot(
+            DIAS,
+            actual["Utilización"] * 100,
+            marker="o",
+            label="Actual",
+        )
+        ax.plot(
+            DIAS,
+            propuesta["Utilización"] * 100,
+            marker="o",
+            label="Escenario 1",
+        )
+
+        ax.set_ylabel("Utilización (%)")
+        ax.set_title(
+            "Utilización diaria — Escenario 1"
+        )
+        ax.legend()
+        ax.grid(alpha=0.25)
+
+        st.pyplot(fig, use_container_width=True)
+
+        st.subheader("3. Simulación")
+
+        if st.button(
+            "🎲 Ejecutar simulación Escenario 1",
+            type="primary",
+            use_container_width=True,
+        ):
+            with st.spinner(
+                f"Ejecutando {replicas} réplicas..."
+            ):
+                sim_a = ejecutar_simulacion_mm1(
+                    S_BASE,
+                    J_BASE,
+                    RATE_SENIOR,
+                    RATE_JUNIOR,
+                    horas_dia,
+                    replicas,
+                    warmup,
+                    int(semilla),
+                )
+
+                sim_b = ejecutar_simulacion_mm1(
+                    S_new,
+                    J_new,
+                    RATE_SENIOR,
+                    RATE_JUNIOR,
+                    horas_dia,
+                    replicas,
+                    warmup,
+                    int(semilla),
+                )
+
+            st.session_state["esc1_sim_a"] = sim_a
+            st.session_state["esc1_sim_b"] = sim_b
+
+        if (
+            "esc1_sim_a" in st.session_state
+            and "esc1_sim_b" in st.session_state
+        ):
+            sim_a = st.session_state["esc1_sim_a"]
+            sim_b = st.session_state["esc1_sim_b"]
+
+            st.dataframe(
+                comparacion_simulaciones(
+                    sim_a,
+                    sim_b,
+                    "Actual",
+                    "Escenario 1",
+                ).style.format({
+                    "Actual": "{:.2f}",
+                    "Escenario 1": "{:.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            diario_a = sim_a["resumen"]
+            diario_b = sim_b["resumen"]
+
+            diario = pd.DataFrame({
+                "Día": DIAS,
+                "Espera actual (min)": diario_a[
+                    "Espera promedio (min)"
+                ],
+                "Espera Esc. 1 (min)": diario_b[
+                    "Espera promedio (min)"
+                ],
+                "P90 actual (min)": diario_a[
+                    "P90 espera (min)"
+                ],
+                "P90 Esc. 1 (min)": diario_b[
+                    "P90 espera (min)"
+                ],
+                "Sistema actual (min)": diario_a[
+                    "Sistema promedio (min)"
+                ],
+                "Sistema Esc. 1 (min)": diario_b[
+                    "Sistema promedio (min)"
+                ],
+            })
+
+            st.subheader(
+                "Resultados de simulación por día"
+            )
+
+            st.dataframe(
+                diario.style.format({
+                    "Espera actual (min)": "{:.2f}",
+                    "Espera Esc. 1 (min)": "{:.2f}",
+                    "P90 actual (min)": "{:.2f}",
+                    "P90 Esc. 1 (min)": "{:.2f}",
+                    "Sistema actual (min)": "{:.2f}",
+                    "Sistema Esc. 1 (min)": "{:.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            fig, ax = plt.subplots(figsize=(11, 5))
+
+            x = np.arange(7)
+            width = 0.35
+
+            ax.bar(
+                x - width / 2,
+                diario["Espera actual (min)"],
+                width,
+                label="Actual",
+            )
+            ax.bar(
+                x + width / 2,
+                diario["Espera Esc. 1 (min)"],
+                width,
+                label="Escenario 1",
+            )
+
+            ax.set_xticks(x)
+            ax.set_xticklabels(DIAS)
+            ax.set_ylabel("Minutos")
+            ax.set_title(
+                "Espera promedio simulada — Escenario 1"
+            )
+            ax.legend()
+            ax.grid(axis="y", alpha=0.25)
+
+            st.pyplot(fig, use_container_width=True)
+
+            st.subheader(
+                "Evolución simulada de la cola"
+            )
+
+            ta = sim_a["trayectoria"]
+            tb = sim_b["trayectoria"]
+
+            fig, ax = plt.subplots(figsize=(12, 5))
+
+            ax.step(
+                ta["Hora"],
+                ta["Cola"],
+                where="post",
+                label="Actual",
+            )
+            ax.step(
+                tb["Hora"],
+                tb["Cola"],
+                where="post",
+                label="Escenario 1",
+            )
+
+            for d in range(1, 7):
+                ax.axvline(
+                    d * horas_dia,
+                    linestyle="--",
+                    alpha=0.3,
+                )
+
+            ax.set_xlabel(
+                "Hora de la semana"
+            )
+            ax.set_ylabel(
+                "Pacientes en cola"
+            )
+            ax.set_title(
+                "Evolución de la cola — primera réplica"
+            )
+            ax.legend()
+            ax.grid(alpha=0.25)
+
+            st.pyplot(fig, use_container_width=True)
+
+        st.download_button(
+            "⬇️ Descargar resultados Escenario 1",
+            data=excel_bytes({
+                "Actual_M_M_1": actual,
+                "Escenario1_M_M_1": propuesta,
+                "Traslados": movimientos,
+            }),
+            file_name="hospital_gloria_escenario1.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+        )
+
+
+
+# ============================================================
+# ESCENARIO 2
+# ============================================================
 
 elif escenario.startswith("Escenario 2"):
 
@@ -1710,6 +2224,7 @@ elif escenario.startswith("Escenario 2"):
         file_name="hospital_gloria_escenario2.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
 
 
 # ============================================================
