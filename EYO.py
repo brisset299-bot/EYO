@@ -1270,7 +1270,7 @@ if escenario.startswith("Escenario 1"):
     demanda_kpi = TOTAL_DEMANDA
     horas_kpi = TOTAL_HORAS
     tasa_kpi = (
-        "S/J diferenciada"
+        "S/J"
     )
     operacion_kpi = f"{horas_dia:.0f} h/día"
 
@@ -1289,13 +1289,13 @@ else:
 k1, k2, k3, k4 = st.columns(4)
 
 k1.metric(
-    "Demanda semanal",
-    f"{demanda_kpi:,.0f} pacientes",
+    "Demanda semanal (pacientes)",
+    f"{demanda_kpi:,.0f}",
 )
 
 k2.metric(
     "Horas médico",
-    f"{horas_kpi:,.2f} h",
+    f"{horas_kpi} h",
 )
 
 k3.metric(
@@ -1791,12 +1791,12 @@ elif escenario.startswith("Escenario 2"):
 
     c.metric(
         "Mix Sénior",
-        f"{mix_actual:.1%} → {mix_nuevo:.1%}",
+        f"{mix_actual:.0%} → {mix_nuevo:.0%}",
     )
 
     d.metric(
         "Tasa efectiva domingo",
-        f"{tasa_2:.2f} → {tasa_efectiva:.4f}",
+        f"{tasa_2:.0f} → {tasa_efectiva:.0f}",
     )
 
     st.info(
